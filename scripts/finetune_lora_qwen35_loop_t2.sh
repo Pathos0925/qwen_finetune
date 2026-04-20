@@ -1,15 +1,15 @@
 #!/bin/bash
 # LoopLM Stage 1 finetune, sized for a single 80GB A100 at T_max=2.
 #
-# Key differences vs finetune_lora_qwen35_loop.sh (T_max=4):
-#   - T_max=2 halves the loop-scaled memory footprint, so we can fit
-#     per_device_train_batch_size=2 with max_seq_length=4096.
-#   - Uses ZeRO-1 instead of ZeRO-2. ZeRO-2 partitions gradients and its
-#     grad-reduce hook trips when the same LoRA params are hit twice per
-#     forward (once per loop iteration); ZeRO-1 keeps only optimizer-state
-#     partitioning and lets autograd accumulate grads naturally.
-#   - max_seq_length explicitly capped at 4096; per-step lm_head logits
-#     dominate memory otherwise.
+# Launched WITHOUT DeepSpeed. DeepSpeed ZeRO-1/2 installs a per-param
+# grad-reduce hook that fires once per backward edge, and our loop
+# reuses the same LoRA params T times per forward, so the hook trips
+# "parameter already reduced" on the second edge. On a single GPU with
+# LoRA there's nothing to shard anyway, so we just run pure PyTorch.
+#
+# Sizing (T_max=2 vs T_max=4):
+#   - Loop-scaled memory halved; per_device_train_batch_size=2 fits at
+#     max_seq_length=4096.
 #   - save_steps dropped to 100 so you can inspect early checkpoints.
 
 MODEL_NAME="Qwen/Qwen3.5-4B"
@@ -24,7 +24,7 @@ BATCH_PER_DEVICE=2
 NUM_DEVICES=1
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
 
-deepspeed --num_gpus=$NUM_DEVICES src/train/train_sft.py \
+python src/train/train_sft.py \
     --lora_enable True \
     --use_dora False \
     --lora_namespan_exclude "['lm_head', 'embed_tokens']" \
@@ -32,7 +32,6 @@ deepspeed --num_gpus=$NUM_DEVICES src/train/train_sft.py \
     --lora_alpha 64 \
     --lora_dropout 0.05 \
     --num_lora_modules -1 \
-    --deepspeed scripts/zero1.json \
     --model_id $MODEL_NAME \
     --data_path train.json \
     --image_folder /tmp \
