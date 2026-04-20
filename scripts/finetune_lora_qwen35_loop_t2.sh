@@ -41,7 +41,7 @@ python src/train/train_sft.py \
     --freeze_merger True \
     --bf16 True \
     --fp16 False \
-    --disable_flash_attn2 True \
+    --disable_flash_attn2 False \
     --output_dir output/qwen35_lora_loop_t2 \
     --num_train_epochs 1 \
     --per_device_train_batch_size $BATCH_PER_DEVICE \
