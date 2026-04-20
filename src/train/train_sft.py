@@ -7,7 +7,12 @@ from transformers import (
     BitsAndBytesConfig, 
     HfArgumentParser, 
 )
-from model.load_model import get_qwen_vl_generation_backbone, load_qwen_vl_generation_model
+from model.load_model import (
+    get_qwen_vl_generation_backbone,
+    install_loop_adapter,
+    load_qwen_vl_generation_model,
+)
+from train.monkey_patch_loop import LOOP_ADAPTER_ATTR
 from trainer import QwenSFTTrainer
 from dataset import make_supervised_data_module
 from params import DataArguments, ModelArguments, TrainingArguments
@@ -65,6 +70,44 @@ def configure_llm(model, training_args):
     llm_params = backbone.language_model.parameters()
     set_requires_grad(llm_params, not training_args.freeze_llm)
 
+def _warm_start_loop_checkpoint(model, ckpt_dir: str):
+    """Warm-start a loop run from a previous loop checkpoint dir.
+
+    Loads:
+      - LoRA adapter weights (via PEFT's set_peft_model_state_dict if present).
+      - non_lora_state_dict.bin, which holds the loop adapter (gate + inter-norm).
+    """
+    import os
+
+    from peft import PeftModel
+    from peft.utils.save_and_load import set_peft_model_state_dict
+    from safetensors.torch import load_file as load_safetensors
+
+    rank0_print(f"Warm-starting loop run from {ckpt_dir}")
+
+    adapter_safetensors = os.path.join(ckpt_dir, "adapter_model.safetensors")
+    adapter_bin = os.path.join(ckpt_dir, "adapter_model.bin")
+    if os.path.isfile(adapter_safetensors):
+        adapter_state = load_safetensors(adapter_safetensors)
+        set_peft_model_state_dict(model, adapter_state)
+    elif os.path.isfile(adapter_bin):
+        adapter_state = torch.load(adapter_bin, map_location="cpu")
+        set_peft_model_state_dict(model, adapter_state)
+    else:
+        rank0_print(f"  (no LoRA adapter file found in {ckpt_dir}; continuing)")
+
+    non_lora_path = os.path.join(ckpt_dir, "non_lora_state_dict.bin")
+    if os.path.isfile(non_lora_path):
+        non_lora_state = torch.load(non_lora_path, map_location="cpu")
+        missing, unexpected = model.load_state_dict(non_lora_state, strict=False)
+        rank0_print(
+            f"  loaded non_lora_state_dict ({len(non_lora_state)} tensors); "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
+    else:
+        rank0_print(f"  (no non_lora_state_dict.bin found in {ckpt_dir})")
+
+
 def unfreeze_topk_layers(model, k_llm: int = 0, k_vis: int = 0):
     backbone = get_qwen_vl_generation_backbone(model)
 
@@ -96,6 +139,17 @@ def train():
     if not training_args.lora_enable:
         assert not training_args.vision_lora, \
             "Error: training_args.lora_enable is not enabled, but training_args.vision_lora is enabled."
+
+    if training_args.loop_enable:
+        if not training_args.freeze_vision_tower or not training_args.freeze_merger:
+            raise ValueError(
+                "loop_enable requires freeze_vision_tower=True and freeze_merger=True. "
+                "Loop training only adapts the LM stack."
+            )
+        if training_args.loop_t_max < 1:
+            raise ValueError("loop_t_max must be >= 1.")
+        if training_args.loop_stage not in (1, 2):
+            raise ValueError("loop_stage must be 1 or 2.")
         
     if training_args.vision_lora and not training_args.freeze_vision_tower:
         raise ValueError("If `vision_lora` is True, `freeze_vision_tower` must also be True.")
@@ -141,6 +195,19 @@ def train():
             training_args.liger_kernel_config = None
 
     model.config.use_cache = False
+
+    if training_args.loop_enable:
+        rank0_print(
+            f"Installing LoopLM adapter (T_max={training_args.loop_t_max}, "
+            f"inter_norm={training_args.loop_inter_norm})."
+        )
+        install_loop_adapter(
+            model,
+            t_max=training_args.loop_t_max,
+            use_inter_norm=training_args.loop_inter_norm,
+            kv_cache_strategy=training_args.loop_kv_cache_strategy,
+        )
+
     model_to_configure = model
     configure_llm(model_to_configure, training_args)
     configure_vision_tower(model_to_configure, training_args, compute_dtype, training_args.device)
@@ -166,6 +233,8 @@ def train():
     
     if training_args.lora_enable:
         lora_namespan_exclude = training_args.lora_namespan_exclude
+        if training_args.loop_enable and LOOP_ADAPTER_ATTR not in lora_namespan_exclude:
+            lora_namespan_exclude = lora_namespan_exclude + [LOOP_ADAPTER_ATTR]
         peft_config = LoraConfig(
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
@@ -195,6 +264,22 @@ def train():
             for name, param in model.named_parameters():
                 if "merger" in name:
                     param.requires_grad = True
+
+    if training_args.loop_enable:
+        # PEFT freezes everything that isn't a LoRA target (and we excluded
+        # the loop adapter on purpose). Re-enable grads on the gate / inter-norm.
+        for name, param in model.named_parameters():
+            if LOOP_ADAPTER_ATTR in name:
+                param.requires_grad = True
+
+        if training_args.loop_stage == 2 and training_args.loop_gate_only:
+            rank0_print("Stage 2 + loop_gate_only: freezing everything except the loop adapter.")
+            for name, param in model.named_parameters():
+                if LOOP_ADAPTER_ATTR not in name:
+                    param.requires_grad = False
+
+        if training_args.load_from_loop_checkpoint is not None:
+            _warm_start_loop_checkpoint(model, training_args.load_from_loop_checkpoint)
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 

@@ -169,3 +169,5 @@ logs/*.log
 
 testing.ipynb
 .vscode/*
+train.json
+output/

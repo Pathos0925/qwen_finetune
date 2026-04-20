@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, List, Union, Dict, Any
 from dataclasses import dataclass
 
@@ -21,8 +22,19 @@ from transformers.pytorch_utils import (
 from transformers.trainer_utils import EvalLoopOutput
 from torch.utils.data import DataLoader
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3
+from train.monkey_patch_loop import LOOP_ADAPTER_ATTR, LOOP_STATE_ATTR
 
 from constants import IGNORE_INDEX
+
+
+def _unwrap_to_generation_model(model):
+    """Strip DDP / accelerate / PEFT layers down to the bare HF generation model."""
+    m = model
+    if hasattr(m, "module"):
+        m = m.module
+    if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
+        m = m.base_model.model
+    return m
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -177,6 +189,126 @@ class QwenSFTTrainer(Trainer):
         if self.args.should_save:
             torch.save(non_lora, os.path.join(output_dir, "non_lora_state_dict.bin"))
             self.model.base_model.config.to_json_file(os.path.join(output_dir, "config.json"))
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if not getattr(self.args, "loop_enable", False):
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
+        labels = inputs.pop("labels", None)
+        if labels is None:
+            raise ValueError("loop_enable requires labels in the batch.")
+
+        # Forward (use_cache=False during training; the patched text-model
+        # forward will stash per-step state on language_model._last_loop_state).
+        # We pop labels so the upstream model.forward doesn't run an extra
+        # lm_head + CE pass we'd discard.
+        outputs = model(**inputs, use_cache=False)
+
+        gen_model = _unwrap_to_generation_model(model)
+        text_model = gen_model.model.language_model
+        state = getattr(text_model, LOOP_STATE_ATTR, None)
+        if state is None:
+            raise RuntimeError(
+                "Loop state was not stashed by the model forward. "
+                "Was install_loop_adapter() called and the loop monkey patch installed?"
+            )
+        # Free the side-channel reference promptly.
+        setattr(text_model, LOOP_STATE_ATTR, None)
+
+        per_step_hidden_states: List[torch.Tensor] = state["per_step_hidden_states"]
+        per_step_lambdas: List[torch.Tensor] = state["per_step_lambdas"]
+        lm_head = gen_model.lm_head
+
+        # Standard HF causal LM shift.
+        shift_labels = labels[..., 1:].contiguous()
+        label_mask = shift_labels != IGNORE_INDEX  # [B, S-1]
+
+        if not label_mask.any():
+            # No supervised tokens — emit a zero loss tied to the graph.
+            zero = sum(h.sum() for h in per_step_hidden_states) * 0.0
+            return (zero, outputs) if return_outputs else zero
+
+        flat_labels = shift_labels[label_mask]  # [N]
+
+        ce_steps: List[torch.Tensor] = []
+        lam_steps: List[torch.Tensor] = []
+        for h_t, lam_t in zip(per_step_hidden_states, per_step_lambdas):
+            h_shift = h_t[..., :-1, :]              # [B, S-1, D]
+            h_active = h_shift[label_mask]          # [N, D]
+            logits_active = lm_head(h_active)       # [N, V]
+            ce = F.cross_entropy(
+                logits_active.float(),
+                flat_labels,
+                reduction="none",
+            )                                       # [N]
+            ce_steps.append(ce)
+            lam_steps.append(lam_t[..., :-1][label_mask])  # [N]
+
+        ce = torch.stack(ce_steps, dim=0)           # [T, N]
+        lam = torch.stack(lam_steps, dim=0)         # [T, N]
+
+        # Build exit distribution p_φ(t | x).
+        T_loops = lam.shape[0]
+        surv = torch.ones_like(lam[0])
+        p_list: List[torch.Tensor] = []
+        for t in range(T_loops - 1):
+            p_list.append(lam[t] * surv)
+            surv = surv * (1 - lam[t])
+        p_list.append(surv)
+        p = torch.stack(p_list, dim=0)              # [T, N]
+
+        loop_stage = int(getattr(self.args, "loop_stage", 1))
+        if loop_stage == 1:
+            beta = float(self.args.loop_beta)
+            expected_ce = (p * ce).sum(0).mean()
+            entropy = -(p * (p + 1e-9).log()).sum(0).mean()
+            loss = expected_ce - beta * entropy
+            with torch.no_grad():
+                steps = torch.arange(1, T_loops + 1, device=p.device, dtype=p.dtype).view(T_loops, 1)
+                mean_exit_step = (p * steps).sum(0).mean()
+                per_step_ce_mean = ce.mean(dim=1)
+            self._maybe_log_loop_metrics({
+                "loop/expected_ce": expected_ce.detach().float().item(),
+                "loop/entropy": entropy.detach().float().item(),
+                "loop/mean_exit_step": mean_exit_step.detach().float().item(),
+                **{f"loop/ce_t{i+1}": v.float().item() for i, v in enumerate(per_step_ce_mean)},
+            })
+        elif loop_stage == 2:
+            ce_d = ce.detach()
+            k = float(self.args.loop_stage2_adaptive_k)
+            gamma = float(self.args.loop_stage2_adaptive_gamma)
+            loss = ce_d.new_zeros((), dtype=lam.dtype)
+            for t in range(1, T_loops):
+                with torch.no_grad():
+                    improvement = (ce_d[t - 1] - ce_d[t]).clamp_min(0.0)
+                    w = torch.sigmoid(k * (improvement - gamma))
+                bce = F.binary_cross_entropy(
+                    torch.clamp(1 - lam[t], 1e-6, 1 - 1e-6),
+                    w,
+                    reduction="mean",
+                )
+                loss = loss + bce
+            loss = loss / max(1, T_loops - 1)
+            with torch.no_grad():
+                self._maybe_log_loop_metrics({
+                    "loop/stage2_loss": loss.detach().float().item(),
+                    "loop/lam_mean": lam.detach().mean().float().item(),
+                })
+        else:
+            raise ValueError(f"Unknown loop_stage {loop_stage}")
+
+        return (loss, outputs) if return_outputs else loss
+
+    def _maybe_log_loop_metrics(self, metrics: Dict[str, float]):
+        # Log on the same cadence as logging_steps so we don't spam.
+        if self.state.global_step % max(1, int(self.args.logging_steps)) != 0:
+            return
+        try:
+            self.log(metrics)
+        except Exception:
+            pass
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         labels = inputs.get("labels") if "labels" in inputs else None

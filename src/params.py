@@ -157,6 +157,52 @@ class TrainingArguments(HFTrainingArguments):
         metadata={"help": "Maximum number of new tokens to generate during evaluation."}
     )
 
+    # LoopLM (Ouro-style) finetuning options
+    loop_enable: bool = field(
+        default=False,
+        metadata={"help": "Wrap the LLM stack in a loop and train an Ouro-style exit gate."},
+    )
+    loop_t_max: int = field(
+        default=4,
+        metadata={"help": "Maximum number of recurrent passes through the LLM layer stack."},
+    )
+    loop_beta: float = field(
+        default=0.1,
+        metadata={"help": "Entropy regularization weight for the exit-distribution prior in stage 1."},
+    )
+    loop_stage: int = field(
+        default=1,
+        metadata={"help": "1 = joint LM+gate (entropy-regularized expected CE). 2 = freeze LM, train gate via BCE adaptive label."},
+    )
+    loop_gate_only: bool = field(
+        default=False,
+        metadata={"help": "Stage 2 helper: freeze everything except the loop gate (LoRA included)."},
+    )
+    loop_share_lm_head: bool = field(
+        default=True,
+        metadata={"help": "Reuse the base lm_head for per-step readouts (recommended)."},
+    )
+    loop_kv_cache_strategy: str = field(
+        default="last",
+        metadata={"help": "Inference-only: full | last | avg. Stamped on config for the patched generate."},
+    )
+    loop_inter_norm: bool = field(
+        default=True,
+        metadata={"help": "Insert a learnable RMSNorm between loop iterations to mitigate residual blowup (Qwen3.5 lacks sandwich-norm)."},
+    )
+    loop_stage2_adaptive_k: float = field(
+        default=50.0,
+        metadata={"help": "Sharpness k for the stage 2 adaptive sigmoid label."},
+    )
+    loop_stage2_adaptive_gamma: float = field(
+        default=0.005,
+        metadata={"help": "Improvement threshold gamma for the stage 2 adaptive label."},
+    )
+    load_from_loop_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Warm-start a loop run from a previous loop checkpoint dir (loads LoRA adapter + non_lora_state_dict.bin containing the gate)."},
+    )
+
 @dataclass
 class DPOArguments(DPOConfigTRL):
     cache_dir: Optional[str] = field(default=None)

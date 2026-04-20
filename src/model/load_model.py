@@ -19,7 +19,12 @@ from train.monkey_patch_forward import (
     replace_qwen3_with_mixed_modality_forward,
     replace_qwen_2_with_mixed_modality_forward,
 )
+from train.monkey_patch_loop import (
+    LOOP_ADAPTER_ATTR,
+    replace_qwen3_5_text_with_looped_forward,
+)
 from train.monkey_patch_vision import replace_qwen2_5_vision
+from model.looplm import LoopAdapter
 
 _GENERATION_MODEL_TYPES = {
     "qwen2_vl",
@@ -87,6 +92,50 @@ def load_qwen_vl_generation_model(
         config=config,
         **kwargs,
     )
+
+
+_LOOP_SUPPORTED_MODEL_TYPES = {"qwen3_5"}
+
+
+def install_loop_adapter(
+    model,
+    *,
+    t_max: int,
+    use_inter_norm: bool = True,
+    kv_cache_strategy: str = "last",
+):
+    """Graft a LoopAdapter onto a loaded Qwen-VL model.
+
+    Must be called *before* PEFT wraps the model so the gate's nn.Linear
+    isn't mistaken for a LoRA target.
+    """
+    config = model.config
+    if config.model_type not in _LOOP_SUPPORTED_MODEL_TYPES:
+        raise ValueError(
+            f"loop_enable is only supported for model_type in "
+            f"{sorted(_LOOP_SUPPORTED_MODEL_TYPES)}; got {config.model_type!r}."
+        )
+
+    # Patch the inner Qwen3_5TextModel.forward to loop the layer stack.
+    replace_qwen3_5_text_with_looped_forward()
+
+    text_model = model.model.language_model
+    text_config = text_model.config
+
+    # Stamp loop knobs on the inner text config (the patched forward reads from it).
+    text_config.loop_t_max = int(t_max)
+    text_config.loop_kv_cache_strategy = kv_cache_strategy
+    # Also stamp on the outer config so it survives `config.to_json_file`.
+    config.loop_t_max = int(t_max)
+    config.loop_kv_cache_strategy = kv_cache_strategy
+    config.loop_enable = True
+
+    d_model = text_config.hidden_size
+    eps = getattr(text_config, "rms_norm_eps", 1e-6)
+    adapter = LoopAdapter(d_model=d_model, eps=eps, use_inter_norm=use_inter_norm)
+    adapter.to(dtype=next(text_model.parameters()).dtype, device=next(text_model.parameters()).device)
+    text_model.add_module(LOOP_ADAPTER_ATTR, adapter)
+    return adapter
 
 
 def get_qwen_vl_sequence_classification_model_cls(model_type: str):
