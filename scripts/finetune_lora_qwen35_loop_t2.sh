@@ -66,4 +66,12 @@ python src/train/train_sft.py \
     --loop_beta 0.1 \
     --loop_stage 1 \
     --loop_inter_norm True \
-    --loop_kv_cache_strategy last
+    --loop_kv_cache_strategy last \
+    --loop_compile_layers False \
+    --loop_compile_mode default
+
+# To try torch.compile-accelerated training, flip --loop_compile_layers to True.
+# This compiles each decoder layer (the safe granularity given our weight-tied
+# loop). First ~20 steps will be slow (compilation); subsequent steps should be
+# faster. If you hit Dynamo errors on the SSM/linear-attention layers, disable.
+# Modes: default | reduce-overhead | max-autotune.

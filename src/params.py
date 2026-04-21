@@ -202,6 +202,14 @@ class TrainingArguments(HFTrainingArguments):
         default=None,
         metadata={"help": "Warm-start a loop run from a previous loop checkpoint dir (loads LoRA adapter + non_lora_state_dict.bin containing the gate)."},
     )
+    loop_compile_layers: bool = field(
+        default=False,
+        metadata={"help": "Apply torch.compile to each decoder layer individually (safer than compiling the whole model — the loop reuses layers, and per-layer compilation gives the cached-graph benefit without the weight-reuse pitfalls of whole-model compilation)."},
+    )
+    loop_compile_mode: str = field(
+        default="default",
+        metadata={"help": "torch.compile mode for layer compilation: default | reduce-overhead | max-autotune. Start with 'default'."},
+    )
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

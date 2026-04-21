@@ -1,854 +1,238 @@
-# Fine-tuning Qwen-VL Series
+# Loop Adapter
 
-This repository contains a script for training [Qwen2-VL](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct), [Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
-, [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking) and [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B) with only using HuggingFace and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
+A finetuning option that grafts an Ouro-style **Looped Language Model** mechanism onto a pretrained Qwen3.5(-VL) checkpoint. Instead of pretraining a LoopLM from scratch, we reuse the existing layer stack `T_max` times per forward pass, attach a small learned **exit gate**, and let LoRA + a tiny inter-loop normalization adapt the backbone to its new recurrent regime.
 
-## Other projects
+The original paper: [arXiv:2510.25741](https://arxiv.org/abs/2510.25741) — ByteDance Seed et al. A condensed, implementation-focused summary lives at `documents/LoopLM_Ouro_condensed.md`.
 
-**[[Phi3-Vision Finetuning]](https://github.com/2U1/Phi3-Vision-Finetune)**<br>
-**[[Llama3.2-Vision Finetuning]](https://github.com/2U1/Llama3.2-Vision-Ft)**<br>
-**[[Molmo Finetune]](https://github.com/2U1/Molmo-Finetune)**<br>
-**[[Pixtral Finetune]](https://github.com/2U1/Pixtral-Finetune)**<br>
-**[[SmolVLM Finetune]](https://github.com/2U1/SmolVLM-Finetune)**<br>
-**[[Gemma3 Finetune]](https://github.com/2U1/Gemma3-Finetune)**
+---
 
-## Update
+## What this adds
 
-- [2026/03/07] 🔥**Supports reasoning mode training for Qwen3-VL and Qwen3.5**
-- [2026/03/07] 🔥**Supports Qwen3.5 Series.**
-- [2026/03/07] Supports Qwen3-VL classification
-- [2026/03/07] Update codebase to `transformers==5.3.0`
-- [2025/11/28] 🔥**Supports video training with DPO and GRPO.**
-- [2025/11/27] 🔥**Supports Qwen3-VL-MoE**
-- [2025/11/26] Update support for liger-kernel in Qwen3-VL.
-- [2025/10/16] 🔥**Supports Qwen3-VL(non-moe)**
-- [2025/08/21] Add option for using 2-layer mlp for classification.
-- [2025/08/21] Add option for unfreeze only few layers for llm and vision tower.
-- [2025/08/08] 🔥Monkey patch Qwen2.5-VL's window attention and forward for using less memory and speedups.
-- [2025/07/25] Updated Classification training script.
-- [2025/05/29] 🔥Supports GRPO training.
-- [2025/04/16] 🔥Supports DPO training.
-- [2025/03/04] Add Option for using liger kernel.
-- [2025/02/18] 🔥Supports mixed-modality dataset with zero3.
-- [2025/02/05] Fixed code for properly use image.
-- [2025/02/03] Support Liger-kernel for Qwen2.5-VL.
-- [2025/02/03] 🔥Supports Qwen2.5-VL.
-- [2025/01/24] Add option for using DoRA.
-- [2025/01/24] Fix error in LoRA training.
-- [2025/01/18] 🔥Supports mixed-modality data.
-- [2024/09/12] 🔥Now the model is trained using [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
-- [2024/09/11] Supports setting different learning rates to projector and vision model.
-- [2024/09/11] 🔥Supports multi-image and video training.
+| Component | Where |
+|-----------|-------|
+| Adapter module: zero-init exit gate + learnable inter-loop RMSNorm | `src/model/looplm.py` |
+| Loss helpers: `exit_distribution`, `stage1_loss`, `stage2_gate_loss` | `src/model/looplm.py` |
+| Looped forward (patches `Qwen3_5TextModel.forward`) | `src/train/monkey_patch_loop.py` |
+| Adapter installation + config stamping | `src/model/load_model.py` (`install_loop_adapter`) |
+| Training-loop wiring (LoRA exclusion, freeze enforcement, warm-start, optional `torch.compile`) | `src/train/train_sft.py` |
+| Custom `compute_loss` (masked, per-step) | `src/trainer/sft_trainer.py` |
+| New `TrainingArguments` fields (`loop_*`, `load_from_loop_checkpoint`, `loop_compile_*`) | `src/params.py` |
+| Example training scripts | `scripts/finetune_lora_qwen35_loop*.sh` |
+| ZeRO-1 config for loop training | `scripts/zero1.json` |
 
-## Table of Contents
+---
 
-- [Fine-tuning Qwen-VL Series](#fine-tuning-qwen-vl-series)
-  - [Other projects](#other-projects)
-  - [Update](#update)
-  - [Table of Contents](#table-of-contents)
-  - [Supported Features](#supported-features)
-  - [Docker](#docker)
-  - [Installation](#installation)
-    - [Environments](#environments)
-    - [Using `requirements.txt`](#using-requirementstxt)
-    - [Using `environment.yaml`](#using-environmentyaml)
-  - [Training Notes](#training-notes)
-  - [Dataset Preparation](#dataset-preparation)
-    - [Reasoning Format](#reasoning-format)
-  - [Supervised Fine Tuning](#supervised-fine-tuning)
-    - [Full Finetuning](#full-finetuning)
-    - [Finetune with LoRA](#finetune-with-lora)
-    - [Train with video dataset](#train-with-video-dataset)
-      - [Image Resolution for vram usage](#image-resolution-for-vram-usage)
-      - [Merge LoRA Weights](#merge-lora-weights)
-    - [Evaluation during Training](#evaluation-during-training)
-      - [Step 1: Prepare Evaluation Dataset](#step-1-prepare-evaluation-dataset)
-      - [Step 2: Define compute\_metrics Function](#step-2-define-compute_metrics-function)
-      - [Step 3: Modify Training Script](#step-3-modify-training-script)
-      - [Step 4: Add Evaluation Arguments](#step-4-add-evaluation-arguments)
-  - [DPO Finetuning](#dpo-finetuning)
-  - [GRPO Finetuning](#grpo-finetuning)
-    - [Prerequisites](#prerequisites)
-  - [Classification Finetuning](#classification-finetuning)
-      - [Experimental Features](#experimental-features)
-  - [Inference](#inference)
-    - [Gradio Infernce (WebUI)](#gradio-infernce-webui)
-  - [Issue for libcudnn error](#issue-for-libcudnn-error)
-  - [TODO](#todo)
-  - [Known Issues](#known-issues)
-  - [License](#license)
-  - [Citation](#citation)
-  - [Acknowledgement](#acknowledgement)
+## Mental model
 
-> [!WARNING]
-> Read [Training Notes](#training-notes) before running any training script. It contains required settings and compatibility notes for `Qwen3.5`, `QLoRA + vision`, `QLoRA + liger`, `DeepSpeed`, and video training.
-
-## Supported Features
-
-- Deepspeed
-- LoRA/QLoRA
-- Full-finetuning
-- Enable finetuning `vision_model` while using LoRA
-- Unfreeze only top-k layer
-- Disable/enable Flash Attention 2
-- Multi-image and video training
-- Training optimized with liger kernel
-- Mixed-modality dataset
-- Direct Preference Optimization (DPO)
-- Group Relative Policy Optimization (GRPO)
-
-## Docker
-
-To simplfy the setting process for training, you could use the provided pre-build environments.<br>
-The settings are done in the conda env named `train`.<br><br>
-You could find more information about the image [here](https://hub.docker.com/repository/docker/john119/vlm/general).
+A standard decoder-only forward pass is one application of the layer stack:
 
 ```
-docker pull john119/vlm
-docker run --gpus all -it -v /host/path:/docker/path --name vlm --ipc=host john119/vlm /bin/bash
+F(x) = lm_head( norm( layer_L( ... layer_1( embed(x) ) ... ) ) )
 ```
 
-## Installation
+A LoopLM applies the same stack `T` times with shared weights:
 
-### Environments
+```
+F^(T)(x) = lm_head( norm( stack( ... stack( embed(x) ) ... ) ) )   # T applications
+```
 
-- Ubuntu 22.04
-- Nvidia-Driver 550.120
-- Cuda version 12.8
+`T = 1` recovers the vanilla model. After each pass `t = 1..T_max`, a small gate produces an instantaneous exit probability `λ_t ∈ (0, 1)` per position. The exit-step distribution `p_φ(t | x)` is built from the survival product of the `λ`s.
 
-Install the required packages using `environment.yaml`.
+Training objective (Stage 1):
 
-### Using `requirements.txt`
+```
+L = Σ_t p_φ(t | x) · L^(t)   −   β · H( p_φ(·|x) )
+```
+
+The first term is the expected per-step cross-entropy under the gate's current preferences. The second is an entropy bonus that prevents the gate from collapsing (uniform-prior ELBO view).
+
+Stage 2 freezes the LM and trains only the gate against a supervised "should I keep looping?" label built from realized loss improvement between successive steps.
+
+---
+
+## Quick start
+
+### 1. Convert the dataset
 
 ```bash
-pip install -r requirements.txt -f https://download.pytorch.org/whl/cu128
-pip install qwen-vl-utils
-pip install flash-attn --no-build-isolation
+python convert_sonnet.py
+# → train.json
 ```
 
-### Using `environment.yaml`
+(There's also `convert.py` for the smaller opus dataset, and `convert_sonnet.py` accepts `--limit N`, `--difficulty`, `--category` for filtering.)
+
+### 2. Train (single A100, 80GB, T_max=2)
 
 ```bash
-conda env create -f environment.yaml
-conda activate train
-pip install qwen-vl-utils
-pip install flash-attn --no-build-isolation
+bash scripts/finetune_lora_qwen35_loop_t2.sh
 ```
 
-**Note:** You should install flash-attn after installing the other packages.
+This is the recommended starting point. Runs Stage 1 (joint LM-via-LoRA + gate training) for one epoch over 122K examples at `T_max=2`. Sized for a single A100 80GB, no DeepSpeed.
 
-## Training Notes
-
-- `Qwen3.5` series: use `--disable_flash_attn2 True` for now. In local testing, Flash Attention 2 raised CUDA errors while `sdpa` was stable. This applies to SFT, CLS, DPO, and GRPO.
-- `QLoRA + vision`: do not combine quantization (`--bits 4` / `--bits 8`) with vision training (`--vision_lora True`, `--freeze_vision_tower False`, or `--unfreeze_topk_vision > 0`). Use `--bits 16` if you want to train vision-related modules.
-- `QLoRA + liger`: disable liger when using QLoRA.
-- `DeepSpeed`: zero2 is usually faster and often more stable than zero3, but it uses more memory.
-- `Video`: do not set `fps` and `nframes` at the same time.
-- `Top-k unfreeze`: if you use `--unfreeze_topk_llm` or `--unfreeze_topk_vision`, keep the corresponding base module frozen first with `--freeze_llm True` or `--freeze_vision_tower True`.
-- `Learning rates`: `vision_model` usually works better with a learning rate about 5x to 10x smaller than `language_model`.
-
-## Dataset Preparation
-
-The script requires a dataset formatted according to the LLaVA specification. The dataset should be a JSON file where each entry contains information about conversations and images. Ensure that the image paths in the dataset match the provided `--image_folder`.<br>
-
-**When using a multi-image dataset, the image tokens should all be `<image>`, and the image file names should have been in a list.**<br><br>
-**Please see the example below and follow format your data.**
-
-<details>
-<summary>Example for single image dataset</summary>
-
-```json
-[
-  {
-    "id": "000000033471",
-    "image": "000000033471.jpg",
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<image>\nWhat are the colors of the bus in the image?"
-      },
-      {
-        "from": "gpt",
-        "value": "The bus in the image is white and red."
-      },
-      {
-        "from": "human",
-        "value": "What feature can be seen on the back of the bus?"
-      },
-      {
-        "from": "gpt",
-        "value": "The back of the bus features an advertisement."
-      },
-      {
-        "from": "human",
-        "value": "Is the bus driving down the street or pulled off to the side?"
-      },
-      {
-        "from": "gpt",
-        "value": "The bus is driving down the street, which is crowded with people and other vehicles."
-      }
-    ]
-  }
-  ...
-]
-```
-
-</details>
-
-<details>
-<summary>Example for multi image dataset</summary>
-
-```json
-[
-  {
-    "id": "000000033471",
-    "image": ["000000033471.jpg", "000000033472.jpg"],
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<image>\n<image>\nIs the perspective of the camera differnt?"
-      },
-      {
-        "from": "gpt",
-        "value": "Yes, It the perspective of the camera is different."
-      }
-    ]
-  }
-  ...
-]
-```
-
-</details>
-
-<details>
-<summary>Example for video dataset</summary>
-
-```json
-[
-  {
-    "id": "sample1",
-    "video": "sample1.mp4",
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<video>\nWhat is going on in this video?"
-      },
-      {
-        "from": "gpt",
-        "value": "A man is walking down the road."
-      }
-    ]
-  }
-  ...
-]
-```
-
-</details>
-
-<details>
-<summary>Example for DPO dataet</summary>
-
-```json
-[
-  {
-    "id": "e4cd017f-3854-4019-9cc1-9dacacb5d424",
-    "image": "example_0_0.png",
-    "prompt": "<image>\nDescribe the key features of the image in great detail.",
-    "chosen": "The image features a modern, multi-colored train parked on a train track, occupying a significant portion of the scene. The train has a unique and striking design, with red, white, and blue colors, as well as yellow accents. It appears to be a high-speed train, indicating its advanced engineering and potential for fast travel.\n\nThe train is situated next to a platform, suggesting that it may be at a train station. The overall scene conveys a sense of transportation and modern technology, with the vibrant and sleek train as the main subject.",
-    "rejected": "The image features a modern, colorful train parked on a set of train tracks. The train has a striking design, with red, white, and blue colors as well as yellow accents. It appears to be a high-speed train, ready for departure.\n\nThe train spans a significant portion of the image, from the left to the right side. The train tracks can be seen clearly beneath the train, emphasizing its position on the railway line. The overall scene gives off an impression of a contemporary and efficient mode of transportation."
-  },
-  {
-    "id": "5e19e647-e5d3-4bcf-82e9-d262570743ae",
-    "image": "example_1_0.png",
-    "prompt": "<image>\nIs this bus in the USA?",
-    "chosen": "Yes, based on the image, it can be assumed that this bus is in the USA. The location of the bus cannot be accurately determined.",
-    "rejected": "No, it's not in the USA. The image does not provide specific information on where the bus is located. However, we can say that it's not in the United States."
-  }
-  ...
-]
-```
-
-</details>
-
-<details>
-<summary>Example for GRPO dataset</summary>
-
-```json
-[
-  {
-    "id": "06bc8a17-bb1c-4007-8c08-92c41e2628b2",
-    "image": "image_2.jpg",
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<image>\nBased on the image, which geometric method is used to determine the bearing angle, and why is it the most appropriate choice?"
-      },
-      {
-        "from": "gpt",
-        "reasoning": "Let's analyze the image step-by-step. The image shows a right-angled triangle with points B, C, and A. The angle at point B is a right angle, indicating that trigonometric functions can be applied. To find the bearing angle, we need to relate the sides of the triangle. The tangent function is suitable here because it relates the opposite side (BC) to the adjacent side (AB) in a right-angled triangle. By using the tangent function, we can calculate the angle at point A, which is the bearing angle. Therefore, the most appropriate geometric method is the use of trigonometric functions.",
-        "value": "<answer>A</answer>"
-      }
-    ]
-  }
-  ...
-]
-```
-
-</details>
-
-### Reasoning Format
-
-You can keep using the normal dataset format, but if you want to train with an explicit reasoning trace you should add a separate `reasoning` field instead of manually concatenating `<think>...</think>` into `value`.
-
-Use `--enable_reasoning True` only for the following model families:
-
-- `Qwen/Qwen3-VL-*-Thinking`
-- `Qwen/Qwen3.5-*`
-
-When `--enable_reasoning True` is enabled, the dataset pipeline follows the official chat template behavior for supported models:
-
-- The assistant prompt scaffold is treated as prompt-only and masked out from the loss.
-- If a reasoning field is present, the prompt is prefixed with the model's reasoning prefill, such as `<|im_start|>assistant\n<think>\n`, and the label starts from the reasoning body.
-- The `reasoning` field is inserted into the reasoning block.
-- The `value` field is treated as the final answer body after the reasoning block.
-
-This is intended to make training-time formatting match the model's default inference-time chat template as closely as possible for supported reasoning models.
-
-For unsupported models such as `Qwen2-VL`, `Qwen2.5-VL`, and non-thinking `Qwen3-VL-Instruct`, `--enable_reasoning True` raises an error on purpose.
-
-**Qwen3.5 special case**
-
-- `Qwen3.5` is the only supported family where samples may mix reasoning and non-reasoning data under `--enable_reasoning True`.
-- If a `Qwen3.5` sample has a `reasoning` field, the prompt uses the open thinking scaffold and the label starts from the reasoning body.
-- If a `Qwen3.5` sample does not have a `reasoning` field, the dataset uses the official non-thinking scaffold `<think>\n\n</think>\n\n` as prompt-only and trains only on the final answer.
-- Even with `--enable_reasoning False`, `Qwen3.5` still uses the official non-thinking prompt scaffold so that training stays compatible with normal `enable_thinking=False` inference.
-
-**Qwen3-VL-Thinking restriction**
-
-- `Qwen3-VL-*-Thinking` does not support reasoning-optional samples in this repo.
-- If you use `--enable_reasoning True` with `Qwen3-VL-*-Thinking`, every assistant sample must include a non-empty `reasoning` field.
-
-**SFT / GRPO format**
-
-Add `reasoning` to the assistant turn:
-
-```json
-[
-  {
-    "id": "sample_reasoning",
-    "image": "example.jpg",
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<image>\nDescribe what happened here."
-      },
-      {
-        "from": "gpt",
-        "reasoning": "The vehicle is in a place where it normally should not be. It is partially submerged and visibly damaged, so an accident is the most likely explanation.",
-        "value": "A damaged vehicle is partially submerged in a swimming pool."
-      }
-    ]
-  }
-]
-```
-
-**DPO format**
-
-Add `chosen_reasoning` and `rejected_reasoning` alongside the corresponding answers:
-
-```json
-[
-  {
-    "id": "sample_dpo_reasoning",
-    "image": "example.jpg",
-    "prompt": "<image>\nDescribe what happened here.",
-    "chosen_reasoning": "The scene is unusual because the vehicle is in a pool and appears damaged, which strongly suggests an accident or deliberate crash scenario.",
-    "chosen": "A damaged vehicle is partially submerged in a swimming pool.",
-    "rejected_reasoning": "The image simply shows a vehicle near water, so there is not enough evidence to say anything unusual happened.",
-    "rejected": "A car is parked beside a swimming pool."
-  }
-]
-```
-
-**Notes**
-
-- The position of the `reasoning` key inside the JSON object does not matter. It can appear before or after `value`.
-- Keep the final answer in `value`, `chosen`, and `rejected`. Do not manually wrap them with `<think>` when using `--enable_reasoning True`.
-- For DPO, each sample must provide both `chosen_reasoning` and `rejected_reasoning`, or neither of them.
-- Reasoning-optional samples are supported only for `Qwen3.5`. `Qwen3-VL-*-Thinking` requires reasoning on every sample when `--enable_reasoning True` is enabled.
-- For `Qwen3.5`, the scaffold inserted by the official chat template remains prompt-only. The loss starts from the reasoning body if present, otherwise from the final answer.
-- If you want complete manual control over the output format, leave `--enable_reasoning False`. Note that `Qwen3.5` still uses the official non-thinking scaffold for compatibility.
-
-<br><br>
-
-Adding the new domain-specific data on top of the general data from open-source data will enhance downstream capabilities while retaining the foundational skills. Of course, you can also choose to fine-tune solely on the new data based on your requirements.
-
-## Supervised Fine Tuning
-
-⚠️**For Qwen3-VL models, using liger-kernel with full fine-tuning is awfully slow. I recommend turning off liger-kernel or use zero2 with full-finetuning.**<br><br>
-
-**Tip:** You could use `adamw_bnb_8bit` for optimizer to save memory.
-
-To run the training script, use the following command:
-
-### Full Finetuning
+For T=4 or multi-GPU setups:
 
 ```bash
-bash scripts/finetune.sh
+bash scripts/finetune_lora_qwen35_loop.sh             # T=4 default
+bash scripts/finetune_lora_qwen35_loop_stage2.sh      # Stage 2 (gate-only) follow-up
 ```
 
-### Finetune with LoRA
+### 3. Read the loop diagnostics
 
-If you want to train only the language model with LoRA and perform full training for the vision model:
+The trainer logs these every step (alongside standard `loss`, `learning_rate`, etc.):
+
+| Metric | Meaning |
+|--------|---------|
+| `loop/ce_t1`, `loop/ce_t2`, ... | Mean CE if the model exited at step `t`. Watch whether `ce_t≥2` drops below `ce_t1` over training. |
+| `loop/expected_ce` | `Σ p_φ(t) · L^(t)` — the loss term being minimized. |
+| `loop/entropy` | Shannon entropy of `p_φ` (max = `ln(T_max)`). Should slowly decrease but not collapse. |
+| `loop/mean_exit_step` | `E[t]` — should drift away from `T_max/2` as the gate forms preferences. |
+
+What to look for: see the **Diagnostics** section below.
+
+---
+
+## CLI flags
+
+All exposed via `TrainingArguments`. Pass on the command line as `--loop_<name> <value>`.
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `loop_enable` | `False` | Master switch. When false, training is a normal LoRA SFT run. |
+| `loop_t_max` | `4` | Number of recurrent passes per forward. Start with `2` if unsure. |
+| `loop_stage` | `1` | `1` = joint LM+gate. `2` = freeze LM, train gate only. |
+| `loop_beta` | `0.1` | Entropy regularizer weight. Lower (`0.05`) gives the gate more freedom. |
+| `loop_inter_norm` | `True` | Insert learnable RMSNorm between loop iterations. Mitigates residual blowup on Qwen3.5 (which is pre-norm, not sandwich-norm). |
+| `loop_gate_only` | `False` | Stage 2 helper: freeze LoRA too, train only the gate. |
+| `loop_share_lm_head` | `True` | Reuse base `lm_head` for per-step readouts. |
+| `loop_kv_cache_strategy` | `"last"` | Inference-only: `full` \| `last` \| `avg`. Stamped onto config. |
+| `loop_stage2_adaptive_k` | `50.0` | Sharpness `k` for the stage-2 BCE label. |
+| `loop_stage2_adaptive_gamma` | `0.005` | Improvement threshold `γ`. |
+| `load_from_loop_checkpoint` | `None` | Warm-start: dir containing a Stage-1 LoRA + `non_lora_state_dict.bin`. |
+| `loop_compile_layers` | `False` | Apply `torch.compile` to each decoder layer (per-layer is the safe granularity for shared-weight loops). |
+| `loop_compile_mode` | `"default"` | `default` \| `reduce-overhead` \| `max-autotune`. |
+
+---
+
+## Stage 1 → Stage 2
+
+Stage 1 trains LoRA + the loop adapter jointly. Stage 2 freezes the LM (and LoRA) and refines only the gate against the adaptive BCE label, which simultaneously penalizes underthinking (exiting when the next loop would still help) and overthinking (continuing when gains have stalled).
 
 ```bash
-bash scripts/finetune_lora.sh
+# Stage 1
+bash scripts/finetune_lora_qwen35_loop.sh
+
+# Stage 2 — warm-starts from Stage-1 output dir
+STAGE1_DIR=output/qwen35_lora_loop_stage1 bash scripts/finetune_lora_qwen35_loop_stage2.sh
 ```
 
-If you want to train both the language model and the vision model with LoRA:
-
-```bash
-bash scripts/finetune_lora_vision.sh
-```
-
-**IMPORTANT:** If you want to tune the `embed_token` with LoRA, You need to tune `lm_head` together.
-
-<details>
-<summary>Training arguments</summary>
-
-- `--deepspeed` (str): Path to DeepSpeed config file (default: "scripts/zero2.json").
-- `--data_path` (str): Path to the LLaVA formatted training data (a JSON file). **(Required)**
-- `--image_folder` (str): Path to the images folder as referenced in the LLaVA formatted training data. **(Required)**
-- `--model_id` (str): Path to the Qwen2-VL model. **(Required)**
-- `--use_liger` (bool): Option for using liger kernel to save memory.
-- `--output_dir` (str): Output directory for model checkpoints
-- `--num_train_epochs` (int): Number of training epochs (default: 1).
-- `--per_device_train_batch_size` (int): Training batch size per GPU per forwarding step.
-- `--gradient_accumulation_steps` (int): Gradient accumulation steps (default: 4).
-- `--freeze_vision_tower` (bool): Option to freeze vision_model (default: False).
-- `--freeze_llm` (bool): Option to freeze LLM (default: False).
-- `--freeze_merger` (bool): Option to tune projector (default: False).
-- `--num_lora_modules` (int): Number of target modules to add LoRA (-1 means all layers).
-- `--vision_lr` (float): Learning rate for vision_model.
-- `--merger_lr` (float): Learning rate for merger(projector).
-- `--learning_rate` (float): Learning rate for language module.
-- `--bf16` (bool): Option for using bfloat16.
-- `--fp16` (bool): Option for using fp16.
-- `--image_min_pixels` (int): Option for minimum input tokens for image.
-- `--image_max_pixles` (int): Option for maximum maxmimum tokens for image.
-- `--video_min_pixels` (int): Option for minimum input tokens for video.
-- `--video_max_pixles` (int): Option for maximum maxmimum tokens for video.
-- `--image_resized_width` (int): Option for setting the width of the input image.
-- `--image_resized_height` (int): Option for setting the height of the input image.
-- `--video_resized_width` (int): Option for setting the width of the input video.
-- `--video_resized_height` (int): Option for setting the height of the input video.
-- `--fps` (float): Frames per second for video data.
-- `--nframes` (int): Number of frames for video data.
-- `--enable_reasoning` (bool): Enable structured reasoning fields for supported reasoning models (`Qwen3-VL-Thinking`, `Qwen3.5`). `Qwen3.5` may mix reasoning and non-reasoning samples. `Qwen3-VL-Thinking` requires a non-empty reasoning field on every sample. For DPO, each sample must provide both `chosen_reasoning` and `rejected_reasoning`, or neither of them.
-- `--unfreeze_topk_llm` (int): Number of top layers to unfreeze in the language model.
-- `--unfreeze_topk_vision` (int): Number of top layers to unfreeze in the vision model.
-- `--lora_enable` (bool): Option for using LoRA.
-- `--vision_lora` (bool): Option for including `vision_tower` in LoRA module. `lora_enable` should be `True` to use this option.
-- `--use_dora` (bool): Option for using DoRA instead of LoRA. `lora_enable` should be `True` to use this option.
-- `--lora_namespan_exclude` (str): Exclude modules with namespans to add LoRA.
-- `--max_seq_length` (int): Maximum sequence length (default: 32K).
-- `--bits` (int): Quantization bits (default: 16).
-- `--disable_flash_attn2` (bool): Disable Flash Attention 2.
-- `--report_to` (str): Reporting tool (choices: 'tensorboard', 'wandb', 'none') (default: 'tensorboard').
-- `--logging_dir` (str): Logging directory (default: "./tf-logs").
-- `--lora_rank` (int): LoRA rank (default: 128).
-- `--lora_alpha` (int): LoRA alpha (default: 256).
-- `--lora_dropout` (float): LoRA dropout (default: 0.05).
-- `--logging_steps` (int): Logging steps (default: 1).
-- `--dataloader_num_workers` (int): Number of data loader workers (default: 4).
-
-</details>
-
-### Train with video dataset
-
-You can train the model using a video dataset. You can set LoRA configs and use for LoRA too.<br>
-
-```bash
-bash scripts/finetune_video.sh
-```
-
-When training with video, it behaves like multi-image input, so adjust `max_pixels` and `fps` based on the available VRAM.
-
-If you run out of vram, you can use [zero3_offload](./scripts/zero3_offload.json) instead of [zero3](./scripts/zero3_offload.json).<br>
-You could use [zero2_offload](./scripts/zero2_offload.json) for a bit faster training.
-
-#### Image Resolution for vram usage
-
-The model supprots a wide range of resolution inputs. By default, it uses the native resolution for input.
-For better performance using native or higer pixel numbers are recommended, however it takes too much memory and computation time for large images. So you could adjust the pixel numbers for it.
-The model splits the image into `token * 28 * 28` so you could just change the the token_num part in the script. <br><br>
-⚠️**For Qwen3-VL models, it should be `token * 32 * 32`.**<br><br>
-For example:
-
-```
---image_min_pixels $((256 * 28 * 28))
---image_max_pixels $((1280 * 28 * 28))
---video_min_pixels $((128 * 28 * 28))
---video_max_pixels $((768 * 28 * 28))
-```
-
-Besides you could directly set the image/video height and width to control over the memory.
-
-```
---image_resized_width 448
---image_resized_height 448
---video_resized_width 448
---video_resized_height 448
-```
-
-These values will be rounded to the nearest multiple of 28.
-
-#### Merge LoRA Weights
-
-```
-bash scripts/merge_lora.sh
-```
-
-**Note:** Remember to replace the paths in `finetune.sh` or `finetune_lora.sh` with your specific paths. (Also in `merge_lora.sh` when using LoRA.)
-
-### Evaluation during Training
-
-You can run generation-based evaluation during training by providing an evaluation dataset and a custom `compute_metrics` function. This allows you to monitor metrics like accuracy, BLEU, or any custom metric based on the model's generated text outputs.
-
-#### Step 1: Prepare Evaluation Dataset
-
-The evaluation dataset uses the same format as the training dataset. Place your evaluation data JSON file and specify the path using `--eval_path`.
-
-```json
-[
-  {
-    "id": "eval_001",
-    "image": "test_image.jpg",
-    "conversations": [
-      {
-        "from": "human",
-        "value": "<image>\nWhat is shown in this image?"
-      },
-      {
-        "from": "gpt",
-        "value": "A cat sitting on a couch."
-      }
-    ]
-  }
-]
-```
-
-#### Step 2: Define compute_metrics Function
-
-Create a custom `compute_metrics` function in your training script. The function receives a `GenerativeEvalPrediction` object containing:
-
-- `predictions`: List of generated text strings from the model
-- `references`: List of ground truth answer strings
-
-```python
-from src.trainer import GenerativeEvalPrediction
-
-def compute_metrics(eval_pred: GenerativeEvalPrediction):
-    predictions = eval_pred.predictions
-    references = eval_pred.references
-
-    # Example: Exact match accuracy
-    correct = sum(
-        1 for p, r in zip(predictions, references)
-        if p.strip().lower() == r.strip().lower()
-    )
-    accuracy = correct / len(predictions) if predictions else 0
-
-    return {"accuracy": accuracy}
-```
+Per the paper, Stage 2 buys ~2–3% on MMLU at matched compute. Skip it for a first pass.
 
-#### Step 3: Modify Training Script
+---
 
-Update your training script (`src/train/train_sft.py`) to pass `compute_metrics` to the trainer:
+## Diagnostics: how to tell it's working
 
-```python
-from src.trainer import QwenSFTTrainer, GenerativeEvalPrediction
+Three independent questions, three independent signals. Don't conflate them.
 
-def compute_metrics(eval_pred: GenerativeEvalPrediction):
-    predictions = eval_pred.predictions
-    references = eval_pred.references
-    correct = sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip())
-    return {"accuracy": correct / len(predictions)}
+### Is the second loop helping at all?
 
-# ... (model and data setup code)
+Watch `ce_t2 - ce_t1`. Healthy trajectory:
 
-trainer = QwenSFTTrainer(
-    model=model,
-    processing_class=processor,
-    args=training_args,
-    compute_metrics=compute_metrics,  # Add this line
-    **data_module
-)
-```
+| Step range | What you want |
+|------------|---------------|
+| 0–100      | `ce_t2 > ce_t1` (backbone hasn't been adapted yet) |
+| 100–500    | Gap shrinks toward 0.1 |
+| 500–2000   | `ce_t2 ≤ ce_t1` on most batches |
+| 2000+      | `ce_t2` stably 0.02–0.1 *below* `ce_t1` |
 
-#### Step 4: Add Evaluation Arguments
+If the gap doesn't shrink by ~step 1000, the loop isn't paying off on your data. The gate will (correctly) collapse to always-exit-at-`t=1`.
 
-Add these arguments to your training script:
+### Is the gate learning input-conditional preferences?
 
-```bash
-  --eval_path /path/to/eval.json \
-  --eval_strategy steps \
-  --eval_steps 500 \
-  --per_device_eval_batch_size 1 \
-  --generation_max_new_tokens 256 \
-  --prediction_loss_only False \
-  # ... other arguments
-```
+Watch `loop/mean_exit_step` and `loop/entropy`:
 
-<details>
-<summary>Evaluation Arguments</summary>
+- `mean_exit_step` drifting away from `T_max/2` and varying across batches → gate is forming preferences.
+- `entropy` slowly decreasing toward 0.3–0.5 (without crashing to 0) → gate is committing without losing exploration.
+- Both pinned at their initial values → gate isn't learning at all.
 
-- `--eval_path` (str): Path to the evaluation data JSON file.
-- `--eval_strategy` (str): Evaluation strategy - "steps" or "epoch" (default: "no").
-- `--eval_steps` (int): Number of steps between evaluations (when eval_strategy="steps").
-- `--per_device_eval_batch_size` (int): Batch size for evaluation (default: 8).
-- `--generation_max_new_tokens` (int): Maximum new tokens to generate during evaluation (default: 512).
-- `--prediction_loss_only` (bool): Set to False to enable generation-based evaluation (default: True).
+### Is the looped model actually better than a plain LoRA?
 
-</details>
+You need a baseline. Run `finetune_lora_qwen35.sh` with the same data, same LR, same step count, and compare on a held-out eval set. The training loss is biased by the loop's `expected_ce` formulation and is not directly comparable.
 
-<details>
-<summary>Example: Custom Metrics with Multiple Scores</summary>
+### Red flags
 
-```python
-from src.trainer import GenerativeEvalPrediction
-import re
+- `NaN` / `Inf` in any `loop/*` → numerical instability. Drop `T_max` to 2 or disable `loop_inter_norm`.
+- `ce_t2 > 5` persistently → second loop is destroying the representation. Try `--loop_inter_norm False`.
+- Loss flat for >500 steps → LoRA isn't getting gradient. Check LR and warmup.
 
-def compute_metrics(eval_pred: GenerativeEvalPrediction):
-    predictions = eval_pred.predictions
-    references = eval_pred.references
+---
 
-    # Exact match
-    exact_matches = sum(
-        1 for p, r in zip(predictions, references)
-        if p.strip().lower() == r.strip().lower()
-    )
+## Performance
 
-    # Contains match (reference appears in prediction)
-    contains_matches = sum(
-        1 for p, r in zip(predictions, references)
-        if r.strip().lower() in p.strip().lower()
-    )
+Speed wins, in priority order:
 
-    n = len(predictions)
-    return {
-        "exact_match": exact_matches / n if n > 0 else 0,
-        "contains_match": contains_matches / n if n > 0 else 0,
-    }
-```
+1. **Install the fast linear-attention path.** Qwen3.5 has hybrid layers (3 linear-attention : 1 full-attention by default). Without `flash-linear-attention` and `causal-conv1d` installed, the linear-attention layers fall back to a slow PyTorch reference and dominate step time.
+   ```bash
+   pip install flash-linear-attention
+   pip install causal-conv1d         # may need a CUDA-toolkit-matching torch build
+   pip install flash-attn --no-build-isolation
+   ```
+2. **Enable Flash Attention 2** for the full-attention layers: drop `--disable_flash_attn2 True`.
+3. **Disable gradient checkpointing** if memory permits. At `T=2` on 80GB you usually have room.
+4. **Try `--loop_compile_layers True`** (per-layer `torch.compile`). First ~20 steps are slow; subsequent steps should be faster.
 
-</details>
+Memory napkin (Qwen3.5-4B, LoRA r=32, bf16, grad-ckpt on, T=2, B=2, S=4096): ~27 GB total. Bump batch or sequence to use more.
 
-**Note:** Generation-based evaluation is slower than loss-only evaluation because it runs `model.generate()` for each sample. Consider using a smaller evaluation dataset or less frequent evaluation steps.
+---
 
-## DPO Finetuning
+## DeepSpeed compatibility
 
-You can train the model using Direct Preference Optimization (DPO).<br>
-The process is quite similar to Supervised Fine-Tuning (SFT), and you can also apply LoRA during DPO training just like in SFT.
+**Don't use DeepSpeed ZeRO-1/2 with looping on a single GPU.** ZeRO installs a per-param grad-reduce hook that fires once per backward edge; the loop reuses each LoRA param T times per forward, so the hook trips an "already reduced" assertion. The provided scripts launch with plain `python` for this reason.
 
-If you are training a supported reasoning model, add `--enable_reasoning True` and provide `chosen_reasoning` / `rejected_reasoning` in the dataset as described in [Reasoning Format](#reasoning-format). Each DPO sample must contain both reasoning fields or neither of them, and reasoning-optional samples are supported only for `Qwen3.5`.
+For multi-GPU, ZeRO-3 may work (different hook semantics) but is untested with this code. If you need it, start there as the first thing to verify on your setup.
 
-```bash
-bash scripts/finetune_dpo.sh
-```
-
-Most of the training arugments are same as SFT, but few other arguments are added for DPO training.
-
-<details>
-<summary>Training arguments</summary>
-
-- `--dpo_loss` (str): Loss type for dpo. (default: 'sigmoid')
-- `--precompute_ref_log_probs` (bool): Wheter to precompute the reference log probs (default: False)
-- `--beta` (float): The beta value for DPO (default: 0.1)
-
-</details>
-
-## GRPO Finetuning
-
-You can traing the model using Group Relative Policy Optimization (GRPO) <br>
-The process is quite similar to Supervised Fine-Tuning (SFT), and you can also apply LoRA during GRPO training just like in SFT.<br>
-<br>
-
-If you are training a supported reasoning model, add `--enable_reasoning True` and store the assistant reasoning in the `reasoning` field of the assistant turn as described in [Reasoning Format](#reasoning-format). Reasoning-optional samples are supported only for `Qwen3.5`.
-
-### Prerequisites
-
-| What                      | Where                       | Notes                                                                                       |
-| ------------------------- | --------------------------- | ------------------------------------------------------------------------------------------- |
-| **Reward functions**      | `src/train/reward_funcs.py` | Add any function that ends with `_reward`. The training script picks them up automatically. |
-| **Custom system prompts** | `src/constants.py`          | Append your own prompt strings here.                                                        |
-
-You could start training using this script.<br>
-Before training, **Please check the dataset format once more.** The format is a bit different from other training methods.
-
-```bash
-bash scripts/finetune_grpo.sh
-```
-
-Most of the training arugments are same as SFT, but few other arguments are added for GRPO training.
-
-<details>
-<summary>Training arguments</summary>
-
-- `--temperature` (float): Generation config (default: 0.9)
-- `--top_p` (float): Generation config (default: 1.0)
-- `--top_k` (int): Generation config (default: 50)
-- `--min_p` (float): Generation config (default: None)
-- `--repetition_penalty` (float): Generation config (default: 1.0)
-- `--max_completion_length` (int): Max length for the completion (default: 256)
-- `--max_prompt_length` (int): Max length for the prompt (default: 512)
-- `--beta` (float): KL Coefficient. (default: 0.04)
-
-</details>
-
-## Classification Finetuning
-
-The [model](src/model/modeling_cls.py) is tailored for classification tasks, such as other SequenceClassification models.
-
-For the classification task, you need to prepare the dataset in a specific format. The dataset should be a JSON file where each entry contains an image and its corresponding label. The labels should be integers starting from 0.<br>
-You can set the text in the filed `prompt` to provide a questions and options for the classification task. Also if your dataset dose not contain the `prompt` field, the script will automatically use the `USER_MESSAGE` from the [cls_dataset.py](src/dataset/cls_dataset.py).<br>
-
-**Please see the example below for the dataset format.**<br>
-
-<details>
-<summary>Example for Classification Dataset</summary>
-
-```json
-[
-  {
-    "id": "06bc8a17-bb1c-4007-8c08-92c41e2628b2",
-    "image": "image_2.jpg",
-    "prompt": "Question: What is in the image? \n Options: \n 1. A train \n 2. A bus \n 3. A car \n 4. A bicycle",
-    "label": "3",
-  }
-  ...
-]
-```
-
-**Note:** You should set the `CLASS_2_ID` variable in the [cls_dataset.py](src/dataset/cls_dataset.py).
-
-</details>
-
-<br>
-
-The dataset can contain **single/multi-image or video data**, and the model will be trained to classify the images/videos based on the provided labels.<br>
-
-For now, you can select loss from one of the following:
-
-- `cross_entropy`
-- `focal_loss`
-- `class_balanced_cross_entropy`
-- `class_balanced_focal_loss`
-
-Also you can set early stopping patience and threshold for the training.
-For example, you can set `--early_stopping_patience 5` and `--early_stopping_threshold 0.01` to stop the training if the validation loss does not improve for 5 epochs with a threshold of 0.01.
-
-Most of the training arugments are same as SFT, but few other arguments are added for classification training.<br><br>
-
-**Tip:** In models like the Qwen family, which have strong context embeddings, even a shallow nonlinearity (a 1-layer MLP) can often improve separability in the tail. This works by introducing a bit of curvature that a purely linear head cannot provide.
-
-<details>
-<summary>Training arguments</summary>
-
-- `--loss_type` (str): Loss type for classification (default: 'cross_entropy').
-- `--focal_alpha` (str): Focal Loss alpha value. If None use CrossEntropyLoss. ex '1.0,7.5' (default: None).
-- `--focal_gamma` (float): Focal Loss gamma value. (default: 0.0)
-- `--num_labels` (int): Number of labels for classification
-- `--class_balanced_beta` (float): Class Balanced beta value. (default: 0.999)
-- `--early_stopping_patience` (int): Early stopping patience (default: 0)
-- `--early_stopping_threshold` (float): Early stopping threshold (default: 0.01)
-- `--mlp_head_dim` (int): Dimension of the MLP head (default: 0)
-- `--mlp_head_dropout` (float): Dropout rate for the MLP head (default: 0.0)
-
-</details>
-
-You can run the training script using the following command:
-
-```bash
-bash scripts/finetune_cls.sh
-```
-
-#### Experimental Features
-
-- Sampler for the dataset. The trainer scripts supports the sampler for the dataset. You could make your own sampler with inherting `DistributedSampler`.
+---
 
 ## Inference
 
-**Note:** You should use the merged weight when trained with LoRA.
+**Not yet implemented.** The patched forward raises `NotImplementedError` when `use_cache=True`. Cached generation needs a per-loop cache wrapper (the paper's "last-step-only KV during decode" trick saves 4× memory but isn't wired up here).
 
-### Gradio Infernce (WebUI)
+Training, eval-loss, and held-out evaluation against a non-cached forward all work today.
 
-1. Install gradio
+---
 
-```
-pip install gradio
-```
+## Known risks specific to Qwen3.5
 
-2. Launch app
+The Ouro paper studied looping on a vanilla decoder transformer with sandwich-norm. Qwen3.5 differs in two material ways:
 
-```
-python -m src.serve.app \
-    --model-path /path/to/merged/weight
-```
+1. **Hybrid attention** — ~3/4 of the layers are gated DeltaNet (linear attention with recurrent state). Looping these is unstudied; their inductive bias under reuse is materially different from self-attention.
+2. **Pre-norm, not sandwich-norm** — residual stream accumulates `T × num_layers` worth of sublayer outputs without external normalization. The `loop_inter_norm` flag (on by default) inserts a learnable RMSNorm between iterations as mitigation, but it is not a guarantee.
 
-You can launch gradio based demo with this command. This can also set some other generation configs like `repetition_penalty`, `temperature` etc.
+If T=4 is unstable, drop to T=2. If T=2 is unstable, the conclusion is that this backbone doesn't loop cleanly and you should either pick a different starting checkpoint (e.g., a pure full-attention Qwen3 variant) or accept that looping doesn't help on this stack.
 
-## Issue for libcudnn error
+---
+
+## Implementation map
 
 ```
-Could not load library libcudnn_cnn_train.so.8. Error: /usr/local/cuda-12.1/lib/libcudnn_cnn_train.so.8: undefined symbol: _ZN5cudnn3cnn34layerNormFwd_execute_internal_implERKNS_7backend11VariantPackEP11CUstream_stRNS0_18LayerNormFwdParamsERKNS1_20NormForwardOperationEmb, version libcudnn_cnn_infer.so.8
+src/
+├── model/
+│   ├── looplm.py                # LoopAdapter + loss helpers
+│   └── load_model.py            # install_loop_adapter
+├── train/
+│   ├── monkey_patch_loop.py     # looped Qwen3_5TextModel.forward
+│   └── train_sft.py             # CLI wiring, freezing, warm-start, compile
+├── trainer/
+│   └── sft_trainer.py           # compute_loss override
+└── params.py                    # loop_* TrainingArguments fields
+
+scripts/
+├── finetune_lora_qwen35_loop_t2.sh         # T=2, single A100
+├── finetune_lora_qwen35_loop.sh            # T=4 default
+├── finetune_lora_qwen35_loop_stage2.sh     # Stage 2
+└── zero1.json                              # ZeRO-1 config (for multi-GPU)
+
+documents/
+├── LoopLM_Ouro_condensed.md                # Paper summary
+├── looplm_finetune_plan.md                 # Implementation plan
+└── looplm_finetune_plan_feedback.md        # Plan review
 ```
-
-You could run `unset LD_LIBRARY_PATH` for this error.
-You could see this [issue](https://github.com/andimarafioti/florence2-finetuning/issues/2)
-
-## TODO
-
-- [x] Support for video data
-- [x] Add demo for multi-image and video
-- [x] Handle mixed-modality data in dataset and collator
-- [x] Support Qwen2.5-VL
-- [x] Monkey-patch liger-kernel for Qwen2.5-VL
-- [x] Update the code base to the latest transformers.
-- [x] Add DPO
-- [x] Add GRPO
-- [x] Support Qwen3-VL(non-moe)
-- [x] Support Qwen3-VL-Moe
-- [x] Support Qwen3.5
-
-## Known Issues
-
-- [libcudnn issue](#issue-for-libcudnn-error)
-
-## License
-
-This project is licensed under the Apache-2.0 License. See the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you find this repository useful in your project, please consider giving a :star: and citing:
-
-```bibtex
-@misc{Qwen2-VL-Finetuning,
-  author = {Yuwon Lee},
-  title = {Qwen2-VL-Finetune},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/2U1/Qwen2-VL-Finetune}
-}
-```
-
-## Acknowledgement
-
-This project is based on
-
-- [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT): An amazing open-source project of LMM.
-- [Mipha](https://github.com/zhuyiche/llava-phi): Open-source projcet of SMM with amazing capabilites.
-- [Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct): Awesome pretrained MLLM based on Qwen2.
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel): Collection of Tirton kernels designed specifically for LLM training.
-- [VLM-R1](https://github.com/om-ai-lab/VLM-R1): Open-source project of Reinforcement Learning with VLMs.

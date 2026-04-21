@@ -70,6 +70,22 @@ def configure_llm(model, training_args):
     llm_params = backbone.language_model.parameters()
     set_requires_grad(llm_params, not training_args.freeze_llm)
 
+def _compile_decoder_layers(model, *, mode: str = "default"):
+    """torch.compile each decoder layer individually.
+
+    Why per-layer and not the whole model: the loop reuses each layer T
+    times per forward. Whole-model compilation struggles with that (shared
+    parameters, mutable side-channel state). Compiling each layer in
+    isolation gives us the cached-graph win — each layer's forward is
+    traced once, reused across both the in-stack loop and the outer T_max
+    loop — without any of the reuse pitfalls.
+    """
+    text_model = get_qwen_vl_generation_backbone(model).language_model
+    rank0_print(f"Compiling {len(text_model.layers)} decoder layers with torch.compile(mode={mode!r})")
+    for i, layer in enumerate(text_model.layers):
+        text_model.layers[i] = torch.compile(layer, mode=mode)
+
+
 def _warm_start_loop_checkpoint(model, ckpt_dir: str):
     """Warm-start a loop run from a previous loop checkpoint dir.
 
@@ -280,6 +296,9 @@ def train():
 
         if training_args.load_from_loop_checkpoint is not None:
             _warm_start_loop_checkpoint(model, training_args.load_from_loop_checkpoint)
+
+        if training_args.loop_compile_layers:
+            _compile_decoder_layers(model, mode=training_args.loop_compile_mode)
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
