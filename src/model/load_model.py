@@ -22,6 +22,7 @@ from train.monkey_patch_forward import (
 from train.monkey_patch_loop import (
     LOOP_ADAPTER_ATTR,
     replace_qwen3_5_text_with_looped_forward,
+    replace_qwen3_vl_text_with_looped_forward,
 )
 from train.monkey_patch_vision import replace_qwen2_5_vision
 from model.looplm import LoopAdapter
@@ -94,7 +95,10 @@ def load_qwen_vl_generation_model(
     )
 
 
-_LOOP_SUPPORTED_MODEL_TYPES = {"qwen3_5"}
+_LOOP_PATCHERS = {
+    "qwen3_5": replace_qwen3_5_text_with_looped_forward,
+    "qwen3_vl": replace_qwen3_vl_text_with_looped_forward,
+}
 
 
 def install_loop_adapter(
@@ -110,14 +114,14 @@ def install_loop_adapter(
     isn't mistaken for a LoRA target.
     """
     config = model.config
-    if config.model_type not in _LOOP_SUPPORTED_MODEL_TYPES:
+    if config.model_type not in _LOOP_PATCHERS:
         raise ValueError(
             f"loop_enable is only supported for model_type in "
-            f"{sorted(_LOOP_SUPPORTED_MODEL_TYPES)}; got {config.model_type!r}."
+            f"{sorted(_LOOP_PATCHERS)}; got {config.model_type!r}."
         )
 
-    # Patch the inner Qwen3_5TextModel.forward to loop the layer stack.
-    replace_qwen3_5_text_with_looped_forward()
+    # Install the looped forward on the inner text model for this backbone.
+    _LOOP_PATCHERS[config.model_type]()
 
     text_model = model.model.language_model
     text_config = text_model.config
